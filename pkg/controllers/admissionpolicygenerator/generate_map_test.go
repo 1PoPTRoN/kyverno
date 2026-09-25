@@ -135,7 +135,20 @@ func TestMapGenerationSkipReason(t *testing.T) {
 			wantReason: "skip generating MutatingAdmissionPolicy: useServerSideApply is enabled, which mutates atomic fields that a native MutatingAdmissionPolicy rejects.",
 		},
 		{
-			name: "generation enabled with pod controllers autogen",
+			// Autogen must come from the spec: status.autogen is filled in asynchronously by the
+			// policy status controller, so it is still empty when a policy is first reconciled.
+			name: "generation enabled with pod controllers autogen, status still empty",
+			policy: &policiesv1beta1.MutatingPolicy{
+				Spec: policiesv1beta1.MutatingPolicySpec{
+					MatchConstraints:     podsMatchConstraints(),
+					AutogenConfiguration: mapGenEnabled(),
+				},
+			},
+			wantSkip:   true,
+			wantReason: "skip generating MutatingAdmissionPolicy: pod controllers autogen is enabled.",
+		},
+		{
+			name: "stale status claiming autogen is ignored",
 			policy: &policiesv1beta1.MutatingPolicy{
 				Spec: policiesv1beta1.MutatingPolicySpec{
 					AutogenConfiguration: mapGenEnabled(),
@@ -146,14 +159,14 @@ func TestMapGenerationSkipReason(t *testing.T) {
 					},
 				},
 			},
-			wantSkip:   true,
-			wantReason: "skip generating MutatingAdmissionPolicy: pod controllers autogen is enabled.",
+			wantSkip: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason := mapGenerationSkipReason(tt.policy)
+			reason, err := mapGenerationSkipReason(tt.policy)
+			assert.NoError(t, err)
 			assert.Equal(t, tt.wantSkip, reason != "")
 			if tt.wantReason != "" {
 				assert.Equal(t, tt.wantReason, reason)

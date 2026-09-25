@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 
+	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
 	"github.com/kyverno/kyverno/pkg/admissionpolicy"
+	vpolautogen "github.com/kyverno/kyverno/pkg/cel/policies/vpol/autogen"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	"github.com/kyverno/kyverno/pkg/event"
 	controllerutils "github.com/kyverno/kyverno/pkg/utils/controller"
@@ -74,20 +76,11 @@ func (c *controller) handleVAPGeneration(ctx context.Context, polType string, po
 		}
 	} else {
 		pol := policy.AsValidatingPolicy()
-		wantVap := pol.GetSpec().GenerateValidatingAdmissionPolicyEnabled()
-		shouldDelete := !wantVap
-
-		var reason string
-		if wantVap {
-			isAutogen := len(pol.GetStatus().Autogen.Configs) > 0
-			if isAutogen {
-				shouldDelete = true
-				reason = "skip generating ValidatingAdmissionPolicy: pod controllers autogen is enabled."
-			}
-		} else {
-			reason = "skip generating ValidatingAdmissionPolicy: not enabled."
+		reason, err := vapGenerationSkipReason(pol)
+		if err != nil {
+			return err
 		}
-		if shouldDelete {
+		if reason != "" {
 			// delete the ValidatingAdmissionPolicy if exist
 			if vapErr == nil {
 				if err := c.client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Delete(ctx, vapName, metav1.DeleteOptions{}); err != nil {
@@ -181,4 +174,23 @@ func (c *controller) handleVAPGeneration(ctx context.Context, polType string, po
 	c.eventGen.Add(event.NewValidatingAdmissionPolicyEvent(policy, observedVAP.Name, observedVAPbinding.Name)...)
 
 	return nil
+}
+
+// vapGenerationSkipReason returns a non-empty reason when a ValidatingAdmissionPolicy must not be
+// generated for the ValidatingPolicy. Pod controllers autogen is computed from the spec rather than
+// read from status.autogen.configs: the policy status controller fills that in asynchronously, so
+// it is still empty on a newly created policy, and status-only updates don't requeue this
+// controller. Reading status generated (and kept) a VAP even though autogen is enabled.
+func vapGenerationSkipReason(pol *policiesv1beta1.ValidatingPolicy) (string, error) {
+	if !pol.GetSpec().GenerateValidatingAdmissionPolicyEnabled() {
+		return "skip generating ValidatingAdmissionPolicy: not enabled.", nil
+	}
+	autogenConfigs, err := vpolautogen.Autogen(pol)
+	if err != nil {
+		return "", err
+	}
+	if len(autogenConfigs) > 0 {
+		return "skip generating ValidatingAdmissionPolicy: pod controllers autogen is enabled.", nil
+	}
+	return "", nil
 }

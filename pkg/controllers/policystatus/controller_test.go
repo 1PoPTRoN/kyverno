@@ -3,6 +3,7 @@ package policystatus
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -489,4 +490,92 @@ func TestReconcileBeta1Conditions_RBACChecksAutogenTargets(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReconcileBeta1Conditions_RBACSkipsSubresources verifies that subresource rules such as
+// "pods/ephemeralcontainers" don't make the RBACPermissionsGranted check fail. The reports
+// controller never watches subresources, and a subresource can't be listed or watched, so
+// checking get/list/watch on one always fails and used to mark the policy not ready for
+// reporting even when the reports controller could read every resource it scans.
+func TestReconcileBeta1Conditions_RBACSkipsSubresources(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	dc := dclient.NewEmptyFakeClient()
+	// Allow top-level resources, deny subresources, and record every reviewed resource.
+	var subresourceReviews atomic.Int32
+	kube := dc.GetKubeClient().(*kubefake.Clientset)
+	kube.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		sar := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview)
+		attrs := sar.Spec.ResourceAttributes
+		isSubresource := attrs.Subresource != "" || strings.Contains(attrs.Resource, "/")
+		if isSubresource {
+			subresourceReviews.Add(1)
+		}
+		return true, &authorizationv1.SubjectAccessReview{
+			Status: authorizationv1.SubjectAccessReviewStatus{Allowed: !isSubresource, Reason: "test"},
+		}, nil
+	})
+
+	c := controller{
+		dclient:          dc,
+		client:           versionedfake.NewSimpleClientset(),
+		authChecker:      auth.NewSubjectChecker(dc.GetKubeClient().AuthorizationV1().SubjectAccessReviews(), "system:serviceaccount:kyverno:reports-controller", nil),
+		polStateRecorder: webhook.NewStateRecorder(nil),
+	}
+
+	vpol := &policiesv1beta1.ValidatingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "block-ephemeral-containers"},
+		Spec: policiesv1beta1.ValidatingPolicySpec{
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
+					RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"pods", "pods/ephemeralcontainers"},
+						},
+					},
+				}},
+			},
+			Validations: []admissionregistrationv1.Validation{{Expression: "true"}},
+		},
+	}
+
+	status := c.reconcileBeta1Conditions(ctx, engineapi.NewValidatingPolicy(vpol))
+
+	cond := findCondition(status.Conditions, policiesv1beta1.PolicyConditionTypeRBACPermissionsGranted)
+	require.NotNil(t, cond, "RBACPermissionsGranted condition should always be set")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status, "RBACPermissionsGranted status, message: %s", cond.Message)
+	assert.Equal(t, "Policy is ready for reporting.", cond.Message)
+	assert.Zero(t, subresourceReviews.Load(), "no access review should be issued for a subresource")
+}
+
+func TestResolveGVRs_SkipsSubresources(t *testing.T) {
+	t.Parallel()
+	rule := func(resources ...string) admissionregistrationv1.NamedRuleWithOperations {
+		return admissionregistrationv1.NamedRuleWithOperations{
+			RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+				Rule: admissionregistrationv1.Rule{
+					APIGroups:   []string{"", "apps"},
+					APIVersions: []string{"v1"},
+					Resources:   resources,
+				},
+			},
+		}
+	}
+
+	got := controller{}.resolveGVRs([]admissionregistrationv1.NamedRuleWithOperations{
+		rule("pods", "pods/ephemeralcontainers", "pods/*"),
+		rule("*/*", "deployments/scale"),
+		rule("*"),
+	})
+
+	assert.Equal(t, []metav1.GroupVersionResource{
+		{Group: "", Version: "v1", Resource: "pods"},
+		{Group: "apps", Version: "v1", Resource: "pods"},
+		{Group: "", Version: "v1", Resource: "*"},
+		{Group: "apps", Version: "v1", Resource: "*"},
+	}, got)
 }

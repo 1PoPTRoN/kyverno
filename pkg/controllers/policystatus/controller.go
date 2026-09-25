@@ -4,6 +4,7 @@ import (
 	"context"
 	baseerrors "errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -536,12 +537,21 @@ func (c controller) reconcileBeta1Conditions(ctx context.Context, policy enginea
 	return status
 }
 
+// resolveGVRs returns the resources the reports controller reads to background-scan the
+// given rules. Subresource entries (e.g. "pods/ephemeralcontainers" or "*/*") are skipped:
+// the reports controller only watches top-level resources (see addGVKToGVRMapping in
+// pkg/controllers/report/resource), and a subresource can't be listed or watched, so
+// checking get/list/watch on it always fails and wrongly marks the policy not ready for
+// reporting.
 func (c controller) resolveGVRs(rules []admissionregistrationv1.NamedRuleWithOperations) []metav1.GroupVersionResource {
 	gvrs := []metav1.GroupVersionResource{}
 	for _, rule := range rules {
 		for _, g := range rule.RuleWithOperations.APIGroups {
 			for _, v := range rule.RuleWithOperations.APIVersions {
 				for _, r := range rule.RuleWithOperations.Resources {
+					if strings.Contains(r, "/") {
+						continue
+					}
 					gvrs = append(gvrs, metav1.GroupVersionResource{
 						Group:    g,
 						Version:  v,

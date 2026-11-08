@@ -1,0 +1,45 @@
+name: Approve tested release publication
+
+permissions: {}
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    # Waits for a reviewer of the release environment. The job holds no write permission and runs
+    # no repository code; publishing jobs never bind an environment, so signer identities stay put.
+    environment: release
+    permissions:
+      actions: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_SHA: ${{ inputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Reject event mismatch before approving publication
+        run: test "$RELEASE_SHA" = "$GITHUB_SHA"
+      - name: Require reviewers on the release environment
+        # GitHub creates a referenced environment without protection rules, so an unconfigured or
+        # later-weakened environment would otherwise let every run through without a reviewer.
+        run: |
+          gh api "repos/$GH_REPO/environments/release" | python3 -c '
+          import json, sys
+          try:
+              rules = json.load(sys.stdin).get("protection_rules") or []
+          except (ValueError, AttributeError):
+              print("::error::Could not read the protection rules of the release environment")
+              sys.exit(1)
+          if not any(rule.get("type") == "required_reviewers" and rule.get("reviewers") for rule in rules):
+              print("::error::The release environment has no required reviewers; add them under Settings > Environments > release, then re-run this job")
+              sys.exit(1)
+          '

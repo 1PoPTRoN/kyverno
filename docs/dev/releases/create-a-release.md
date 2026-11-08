@@ -54,6 +54,13 @@ Before the first release from a line:
    external Krew PR remains the Krew maintainers' responsibility.
 5. Ensure the repository's Actions retention policy permits the requested 90-day
    retention. Recovery requires the original run's immutable candidate artifacts.
+6. Ensure a repository admin has created the `release` environment under
+   Settings > Environments with **Required reviewers** (for example
+   `@kyverno/kyverno-core-maintainers`), ideally with **Prevent self-review**.
+   Limit **Deployment branches and tags** to tags `v*` and branches `main` and
+   `release-*`; pre-tag runs deploy from their branch. The approval job fails
+   while the environment has no required reviewers, so a missing or weakened
+   environment blocks publication instead of skipping the review.
 
 ## Choose one entry point
 
@@ -70,6 +77,9 @@ git push upstream refs/tags/v1.20.2-rc.3
 The `releaser` workflow validates and publishes the application **and both
 charts**. It does not require a chart metadata commit, chart tags, a separate
 Helm dispatch, manual upload, or a separate Krew action.
+
+After validation, the run waits for a `release` environment reviewer to
+approve it. Nothing is published before that approval.
 
 **A pushed tag is already public before Actions starts.** This entry point gates
 artifact publication, not tag creation. Never move or delete a failed public tag.
@@ -92,10 +102,12 @@ same event commit, not an arbitrary SHA checked out from a newer workflow. If
 the branch moved, dispatch on a branch containing the desired reviewed commit;
 do not weaken the exact-SHA check.
 
-After validation, the workflow creates the tag with `GITHUB_TOKEN` and calls
+After validation and a `release` environment approval, the workflow creates
+the tag with `GITHUB_TOKEN` and calls
 publication directly in the **same run**, reusing the tested candidate. A token-
 created tag does not produce a second tag workflow. An existing tag pointing to
 the same commit is an idempotent retry; a different target fails without moving it.
+A rejected approval ends the run before the tag exists.
 
 Both entry points share a per-tag concurrency lock with cancellation disabled.
 
@@ -179,7 +191,8 @@ failure gates, prereleases, conflicting content, and interrupted retry rules.
 
 ### Publish retained bytes, then verify remotely
 
-Only successful validation unlocks publication:
+Only successful validation and a `release` environment approval unlock
+publication:
 
 1. Create or reuse a **draft** GitHub release.
 2. Copy the retained multi-platform OCI image layouts to their exact image tags;

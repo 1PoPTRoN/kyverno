@@ -1224,10 +1224,120 @@ class RetryAndGates(unittest.TestCase):
                         self.assertEqual(step["with"]["ref"], "${{ inputs.sha }}", name)
                         self.assertEqual(step["with"]["persist-credentials"], "false", name)
         for filename, job in (("release-validate.yaml", "codegen"),
+                              ("release-approval.yaml", "approve"),
                               ("release-publish.yaml", "draft"),
                               ("helm-release.yaml", "publish")):
             self.assertEqual(self.workflow(filename)["jobs"][job]["steps"][0]["run"],
                              'test "$RELEASE_SHA" = "$GITHUB_SHA"')
+
+    def grants_write(self, permissions):
+        # A job without its own block inherits the workflow's, and a workflow without one gets the
+        # repository default, which can be write: treat a missing block as a grant.
+        if permissions is None:
+            return True
+        if isinstance(permissions, str):
+            return permissions == "write-all"
+        return "write" in permissions.values()
+
+    def needed_by(self, jobs, name):
+        needed, pending = set(), [name]
+        while pending:
+            needs = jobs[pending.pop()].get("needs", [])
+            for job in [needs] if isinstance(needs, str) else needs:
+                if job not in needed:
+                    needed.add(job)
+                    pending.append(job)
+        return needed
+
+    def test_every_publication_entrypoint_waits_for_release_approval(self):
+        workflows = {path.name: self.workflow(path.name)
+                     for path in sorted((ROOT / ".github/workflows").glob("*.yaml"))}
+
+        def callers(reusable):
+            return sorted((name, job) for name, workflow in workflows.items()
+                          for job, spec in workflow.get("jobs", {}).items()
+                          if spec.get("uses") == f"./.github/workflows/{reusable}")
+
+        entrypoints = sorted({name for name, _ in callers("release-publish.yaml")})
+        self.assertEqual(entrypoints, ["prepare-release.yaml", "release.yaml"])
+        self.assertEqual(callers("helm-release.yaml"), [("release-publish.yaml", "charts")])
+        for name in ("release-approval.yaml", "release-publish.yaml", "helm-release.yaml"):
+            self.assertEqual(list(workflows[name]["on"]), ["workflow_call"], name)
+        for name in entrypoints:
+            jobs = workflows[name]["jobs"]
+            gates = {job for caller, job in callers("release-approval.yaml") if caller == name}
+            self.assertEqual(len(gates), 1, name)
+            self.assertIn("validate", self.needed_by(jobs, next(iter(gates))))
+            for job, spec in jobs.items():
+                if self.grants_write(spec.get("permissions", workflows[name].get("permissions"))):
+                    with self.subTest(workflow=name, job=job):
+                        self.assertTrue(gates & self.needed_by(jobs, job),
+                                        f"{name}: {job} can write before release approval")
+        self.assertIn("approve", self.needed_by(workflows["prepare-release.yaml"]["jobs"], "tag"))
+
+    def test_release_approval_requires_reviewers_and_keeps_signer_identities(self):
+        jobs = self.workflow("release-approval.yaml")["jobs"]
+        self.assertEqual(list(jobs), ["approve"])
+        approve = jobs["approve"]
+        environment = approve["environment"]
+        self.assertEqual(environment if isinstance(environment, str) else environment["name"], "release")
+        self.assertFalse(self.grants_write(approve["permissions"]))
+        self.assertFalse([step for step in approve["steps"] if "uses" in step])
+        # An environment changes the OIDC subject of its job; signing jobs must not get one.
+        for name in ("release-publish.yaml", "helm-release.yaml"):
+            for job, spec in self.workflow(name)["jobs"].items():
+                self.assertNotIn("environment", spec, f"{name}: {job}")
+        check = next(step["run"] for step in approve["steps"] if "gh api" in step.get("run", ""))
+        reviewers = '{"type":"required_reviewers","reviewers":[{"type":"Team","reviewer":{"slug":"maintainers"}}]}'
+        cases = {
+            "required reviewers": ('{"protection_rules":[%s]}' % reviewers, 0, True),
+            "auto-created": ('{"name":"release","protection_rules":[]}', 0, False),
+            "wait timer only": ('{"protection_rules":[{"type":"wait_timer","wait_timer":5}]}', 0, False),
+            "empty reviewer list": ('{"protection_rules":[{"type":"required_reviewers","reviewers":[]}]}', 0, False),
+            "null body": ("null", 0, False),
+            "api failure": ("", 1, False),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            gh = Path(directory) / "gh"
+            gh.write_text('#!/bin/sh\necho "$*" > "$GH_CALL"\nprintf "%s" "$GH_RESPONSE"\nexit "$GH_STATUS"\n')
+            gh.chmod(0o755)
+            call = Path(directory) / "call"
+            for case, (response, status, allowed) in cases.items():
+                with self.subTest(case=case):
+                    process = subprocess.run(
+                        ["bash", "-e", "-c", check], capture_output=True, text=True, timeout=30,
+                        env={**os.environ, "PATH": f"{directory}:{os.environ['PATH']}",
+                             "GH_REPO": "kyverno/kyverno", "GH_CALL": str(call),
+                             "GH_RESPONSE": response, "GH_STATUS": str(status)},
+                    )
+                    self.assertEqual(process.returncode == 0, allowed, process.stdout + process.stderr)
+                    self.assertEqual(call.read_text().strip(), "api repos/kyverno/kyverno/environments/release")
+                    if not allowed:
+                        self.assertIn("::error::", process.stdout)
+
+    def test_credentials_never_expand_into_workflow_scripts(self):
+        # ${{ }} is substituted into the script file before the shell starts, so a credential there
+        # lands on disk and in argv; read it from env: and pass it on stdin instead.
+        credential = re.compile(r"\$\{\{[^}]*\b(?:secrets\.\w+|github\.token)\b")
+
+        def scripts(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == "run" and isinstance(value, str):
+                        yield value
+                    else:
+                        yield from scripts(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from scripts(item)
+
+        paths = [*sorted((ROOT / ".github/workflows").glob("*.y*ml")),
+                 *sorted((ROOT / ".github/actions").rglob("*.y*ml"))]
+        self.assertTrue(paths)
+        for path in paths:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                document = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+                self.assertEqual([script for script in scripts(document) if credential.search(script)], [])
 
     def test_special_conformance_suites_retain_per_test_reports(self):
         for name in ("check-tests",):

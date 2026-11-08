@@ -59,6 +59,7 @@ jobs:
             .github/workflows/check-release-automation.yaml \
             .github/workflows/prepare-release.yaml \
             .github/workflows/release.yaml \
+            .github/workflows/release-approval.yaml \
             .github/workflows/release-publish.yaml \
             .github/workflows/release-validate.yaml \
             .github/workflows/helm-release.yaml \

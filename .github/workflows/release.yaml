@@ -23,8 +23,17 @@ jobs:
       tag: ${{ github.ref_name }}
       sha: ${{ github.sha }}
 
-  publish:
+  approve:
     needs: validate
+    permissions:
+      actions: read
+    uses: ./.github/workflows/release-approval.yaml
+    with:
+      tag: ${{ github.ref_name }}
+      sha: ${{ github.sha }}
+
+  publish:
+    needs: [validate, approve]
     permissions:
       contents: write
       actions: read

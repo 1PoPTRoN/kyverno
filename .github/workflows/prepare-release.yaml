@@ -45,8 +45,18 @@ jobs:
       tag: ${{ inputs.tag }}
       sha: ${{ inputs.sha }}
 
-  tag:
+  # Approval precedes the tag: a rejected release must not leave a public tag, which never moves.
+  approve:
     needs: validate
+    permissions:
+      actions: read
+    uses: ./.github/workflows/release-approval.yaml
+    with:
+      tag: ${{ inputs.tag }}
+      sha: ${{ inputs.sha }}
+
+  tag:
+    needs: [validate, approve]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -64,7 +74,7 @@ jobs:
         run: python3 scripts/release/tag.py
 
   publish:
-    needs: [validate, tag]
+    needs: [validate, approve, tag]
     permissions:
       contents: write
       actions: read

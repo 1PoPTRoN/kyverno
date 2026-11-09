@@ -2,6 +2,8 @@ package admissionpolicygenerator
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -210,10 +212,6 @@ func (c *controller) reconcile(ctx context.Context, logger logr.Logger, key, nam
 
 	polType := strings.Split(key, "/")[0]
 	if polType == "ValidatingPolicy" {
-		generateValidatingAdmissionPolicy := toggle.FromContext(context.TODO()).GenerateValidatingAdmissionPolicy()
-		if !generateValidatingAdmissionPolicy {
-			return nil
-		}
 		vpol, err := c.getValidatingPolicy(name)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
@@ -223,6 +221,15 @@ func (c *controller) reconcile(ctx context.Context, logger logr.Logger, key, nam
 			return err
 		}
 		policy = engineapi.NewValidatingPolicy(vpol)
+		generateValidatingAdmissionPolicy := toggle.FromContext(context.TODO()).GenerateValidatingAdmissionPolicy()
+		if !generateValidatingAdmissionPolicy {
+			if !vpol.GetStatus().Generated {
+				return nil
+			}
+			// The flag was turned off after a ValidatingAdmissionPolicy was generated for this policy.
+			// Nothing keeps that ValidatingAdmissionPolicy in step with the policy any more.
+			return c.removeValidatingAdmissionPolicy(ctx, policy, "skip generating ValidatingAdmissionPolicy: disabled by the generateValidatingAdmissionPolicy flag.")
+		}
 		err = c.handleVAPGeneration(ctx, policy)
 		if err != nil {
 			return err
@@ -238,10 +245,13 @@ func (c *controller) reconcile(ctx context.Context, logger logr.Logger, key, nam
 		}
 		generateMutatingAdmissionPolicy := toggle.FromContext(context.TODO()).GenerateMutatingAdmissionPolicy()
 		if !generateMutatingAdmissionPolicy {
-			if !mpol.Spec.GenerateMutatingAdmissionPolicyEnabled() {
+			if mpol.Spec.GenerateMutatingAdmissionPolicyEnabled() {
+				logger.Info("generating MutatingAdmissionPolicy explicitly enabled in policy", "policy", mpol.GetName())
+			} else if !mpol.GetStatus().Generated {
 				return nil
 			}
-			logger.Info("generating MutatingAdmissionPolicy explicitly enabled in policy", "policy", mpol.GetName())
+			// A policy that opted out after its MutatingAdmissionPolicy was generated falls through,
+			// so that handleMAPGeneration removes the MutatingAdmissionPolicy.
 		}
 		err = c.handleMAPGeneration(ctx, mpol)
 		if err != nil {
@@ -278,4 +288,19 @@ func (c *controller) updatePolicyStatus(ctx context.Context, policy engineapi.Ge
 		logging.V(3).Info("updated mutating policy status", "name", mpol.GetName(), "status", new.Status)
 	}
 	return nil
+}
+
+// handleGenerationError hands admission back to Kyverno when the native admission policy could not
+// be brought in line with the policy. While status.generated is true, the webhook controller leaves
+// the policy out of Kyverno's webhooks and the CEL engines drop it from their caches, so keeping the
+// flag would leave the previously generated native policy, stale or missing, as the only enforcer.
+// A native policy that still exists is left in place: it enforces the last revision that generated
+// successfully until a retry updates it, while deleting it before Kyverno's webhook picks the policy
+// up would leave a window with nothing enforcing it. genErr is returned so the workqueue retries.
+func (c *controller) handleGenerationError(ctx context.Context, policy engineapi.GenericPolicy, kind string, genErr error) error {
+	msg := fmt.Sprintf("failed to generate %s, Kyverno evaluates the policy instead: %v", kind, genErr)
+	if err := c.updatePolicyStatus(ctx, policy, false, msg); err != nil {
+		return errors.Join(genErr, err)
+	}
+	return genErr
 }

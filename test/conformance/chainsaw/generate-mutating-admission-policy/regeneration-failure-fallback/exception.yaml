@@ -1,0 +1,12 @@
+apiVersion: policies.kyverno.io/v1beta1
+kind: PolicyException
+metadata:
+  name: map-regeneration-failure-fallback
+spec:
+  policyRefs:
+  - name: map-regeneration-failure-fallback
+    kind: MutatingPolicy
+  matchConditions:
+    # the extended policy reuses this name, which the API server rejects in a MutatingAdmissionPolicy
+    - name: shared-name
+      expression: "object.metadata.name == 'skipped-deployment'"

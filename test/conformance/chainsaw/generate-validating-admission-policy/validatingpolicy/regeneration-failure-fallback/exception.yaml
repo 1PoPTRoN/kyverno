@@ -1,0 +1,12 @@
+apiVersion: policies.kyverno.io/v1beta1
+kind: PolicyException
+metadata:
+  name: regeneration-failure-fallback
+spec:
+  policyRefs:
+  - name: regeneration-failure-fallback
+    kind: ValidatingPolicy
+  matchConditions:
+    # the tightened policy reuses this name, which the API server rejects in a ValidatingAdmissionPolicy
+    - name: shared-name
+      expression: "object.metadata.name == 'skipped-deployment'"

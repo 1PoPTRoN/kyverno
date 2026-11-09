@@ -16,6 +16,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const mutatingAdmissionPolicyKind = "MutatingAdmissionPolicy"
+
 // preferredMAPVersion returns the API version to use based on which listers are initialised.
 // Both the policy and binding listers must be set for a version to be considered available.
 func (c *controller) preferredMAPVersion() (admissionpolicy.MutatingAdmissionPolicyVersion, bool) {
@@ -35,7 +37,8 @@ func (c *controller) handleMAPGeneration(ctx context.Context, mpol *policiesv1be
 	version, ok := c.preferredMAPVersion()
 	if !ok {
 		logger.V(2).Info("No MutatingAdmissionPolicy lister available, skipping MAP generation", "policy", mpol.GetName())
-		if mpol.GetSpec().GenerateMutatingAdmissionPolicyEnabled() {
+		// A policy still marked generated has no MutatingAdmissionPolicy the cluster can serve any more.
+		if mpol.GetSpec().GenerateMutatingAdmissionPolicyEnabled() || mpol.GetStatus().Generated {
 			genericPolicy := engineapi.NewMutatingPolicy(mpol)
 			return c.updatePolicyStatus(ctx, genericPolicy, false, "skip generating MutatingAdmissionPolicy: requested but no MutatingAdmissionPolicy API/informers are available.")
 		}
@@ -61,38 +64,55 @@ func (c *controller) handleMAPGenerationWithVersion(ctx context.Context, mpol *p
 
 	reason, err := mapGenerationSkipReason(mpol)
 	if err != nil {
-		return fmt.Errorf("failed to compute autogen configs for %s: %w", mpol.GetName(), err)
+		return c.handleGenerationError(ctx, genericPolicy, mutatingAdmissionPolicyKind, fmt.Errorf("failed to compute autogen configs for %s: %w", mpol.GetName(), err))
 	}
 	shouldDelete := reason != ""
+	if shouldDelete {
+		// Hand admission back to Kyverno before deleting, for the reasons given on
+		// removeValidatingAdmissionPolicy.
+		if err := c.updatePolicyStatus(ctx, genericPolicy, false, reason); err != nil {
+			return err
+		}
+	}
 
 	switch version {
 	case admissionpolicy.MutatingAdmissionPolicyVersionV1:
-		return c.handleMAPV1(ctx, mpol, mapName, mapBindingName, shouldDelete, reason, genericPolicy)
+		err = c.handleMAPV1(ctx, mpol, mapName, mapBindingName, shouldDelete)
 	case admissionpolicy.MutatingAdmissionPolicyVersionV1beta1:
-		return c.handleMAPV1Beta1(ctx, mpol, mapName, mapBindingName, shouldDelete, reason, genericPolicy)
+		err = c.handleMAPV1Beta1(ctx, mpol, mapName, mapBindingName, shouldDelete)
 	case admissionpolicy.MutatingAdmissionPolicyVersionV1alpha1:
-		return c.handleMAPV1Alpha1(ctx, mpol, mapName, mapBindingName, shouldDelete, reason, genericPolicy)
+		err = c.handleMAPV1Alpha1(ctx, mpol, mapName, mapBindingName, shouldDelete)
 	default:
-		return fmt.Errorf("unsupported MutatingAdmissionPolicy version: %s", version)
+		err = fmt.Errorf("unsupported MutatingAdmissionPolicy version: %s", version)
 	}
+	if shouldDelete {
+		// status.generated is already false, so a failed delete only needs a retry.
+		return err
+	}
+	if err != nil {
+		return c.handleGenerationError(ctx, genericPolicy, mutatingAdmissionPolicyKind, err)
+	}
+	return c.updatePolicyStatus(ctx, genericPolicy, true, "")
 }
 
-func (c *controller) handleMAPV1(ctx context.Context, mpol *policiesv1beta1.MutatingPolicy, mapName, mapBindingName string, shouldDelete bool, reason string, genericPolicy engineapi.GenericPolicy) error {
+// handleMAPV1 deletes the v1 MutatingAdmissionPolicy and its binding when shouldDelete is set, and
+// otherwise creates or updates them so that they match the policy.
+func (c *controller) handleMAPV1(ctx context.Context, mpol *policiesv1beta1.MutatingPolicy, mapName, mapBindingName string, shouldDelete bool) error {
 	observedMAP, mapErr := c.getMutatingAdmissionPolicyV1(mapName)
 	observedMAPbinding, mapBindingErr := c.getMutatingAdmissionPolicyBindingV1(mapBindingName)
 
 	if shouldDelete {
 		if mapErr == nil {
-			if err := c.client.AdmissionregistrationV1().MutatingAdmissionPolicies().Delete(ctx, mapName, metav1.DeleteOptions{}); err != nil {
+			if err := c.client.AdmissionregistrationV1().MutatingAdmissionPolicies().Delete(ctx, mapName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
 		if mapBindingErr == nil {
-			if err := c.client.AdmissionregistrationV1().MutatingAdmissionPolicyBindings().Delete(ctx, mapBindingName, metav1.DeleteOptions{}); err != nil {
+			if err := c.client.AdmissionregistrationV1().MutatingAdmissionPolicyBindings().Delete(ctx, mapBindingName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
-		return c.updatePolicyStatus(ctx, genericPolicy, false, reason)
+		return nil
 	}
 
 	celexceptions, err := c.getCELExceptions(mpol.GetName(), mpol.GetKind())
@@ -145,7 +165,7 @@ func (c *controller) handleMAPV1(ctx context.Context, mpol *policiesv1beta1.Muta
 		}
 	}
 
-	return c.updatePolicyStatus(ctx, genericPolicy, true, "")
+	return nil
 }
 
 // mapGenerationSkipReason returns a non-empty reason when a MutatingAdmissionPolicy must not be
@@ -172,22 +192,23 @@ func mapGenerationSkipReason(mpol *policiesv1beta1.MutatingPolicy) (string, erro
 	return "", nil
 }
 
-func (c *controller) handleMAPV1Alpha1(ctx context.Context, mpol *policiesv1beta1.MutatingPolicy, mapName, mapBindingName string, shouldDelete bool, reason string, genericPolicy engineapi.GenericPolicy) error {
+// handleMAPV1Alpha1 is handleMAPV1 for the v1alpha1 API.
+func (c *controller) handleMAPV1Alpha1(ctx context.Context, mpol *policiesv1beta1.MutatingPolicy, mapName, mapBindingName string, shouldDelete bool) error {
 	observedMAP, mapErr := c.getMutatingAdmissionPolicy(mapName)
 	observedMAPbinding, mapBindingErr := c.getMutatingAdmissionPolicyBinding(mapBindingName)
 
 	if shouldDelete {
 		if mapErr == nil {
-			if err := c.client.AdmissionregistrationV1alpha1().MutatingAdmissionPolicies().Delete(ctx, mapName, metav1.DeleteOptions{}); err != nil {
+			if err := c.client.AdmissionregistrationV1alpha1().MutatingAdmissionPolicies().Delete(ctx, mapName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
 		if mapBindingErr == nil {
-			if err := c.client.AdmissionregistrationV1alpha1().MutatingAdmissionPolicyBindings().Delete(ctx, mapBindingName, metav1.DeleteOptions{}); err != nil {
+			if err := c.client.AdmissionregistrationV1alpha1().MutatingAdmissionPolicyBindings().Delete(ctx, mapBindingName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
-		return c.updatePolicyStatus(ctx, genericPolicy, false, reason)
+		return nil
 	}
 
 	celexceptions, err := c.getCELExceptions(mpol.GetName(), mpol.GetKind())
@@ -242,25 +263,26 @@ func (c *controller) handleMAPV1Alpha1(ctx context.Context, mpol *policiesv1beta
 		}
 	}
 
-	return c.updatePolicyStatus(ctx, genericPolicy, true, "")
+	return nil
 }
 
-func (c *controller) handleMAPV1Beta1(ctx context.Context, mpol *policiesv1beta1.MutatingPolicy, mapName, mapBindingName string, shouldDelete bool, reason string, genericPolicy engineapi.GenericPolicy) error {
+// handleMAPV1Beta1 is handleMAPV1 for the v1beta1 API.
+func (c *controller) handleMAPV1Beta1(ctx context.Context, mpol *policiesv1beta1.MutatingPolicy, mapName, mapBindingName string, shouldDelete bool) error {
 	observedMAP, mapErr := c.getMutatingAdmissionPolicyBeta(mapName)
 	observedMAPbinding, mapBindingErr := c.getMutatingAdmissionPolicyBindingBeta(mapBindingName)
 
 	if shouldDelete {
 		if mapErr == nil {
-			if err := c.client.AdmissionregistrationV1beta1().MutatingAdmissionPolicies().Delete(ctx, mapName, metav1.DeleteOptions{}); err != nil {
+			if err := c.client.AdmissionregistrationV1beta1().MutatingAdmissionPolicies().Delete(ctx, mapName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
 		if mapBindingErr == nil {
-			if err := c.client.AdmissionregistrationV1beta1().MutatingAdmissionPolicyBindings().Delete(ctx, mapBindingName, metav1.DeleteOptions{}); err != nil {
+			if err := c.client.AdmissionregistrationV1beta1().MutatingAdmissionPolicyBindings().Delete(ctx, mapBindingName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
-		return c.updatePolicyStatus(ctx, genericPolicy, false, reason)
+		return nil
 	}
 
 	celexceptions, err := c.getCELExceptions(mpol.GetName(), mpol.GetKind())
@@ -315,5 +337,5 @@ func (c *controller) handleMAPV1Beta1(ctx context.Context, mpol *policiesv1beta1
 		}
 	}
 
-	return c.updatePolicyStatus(ctx, genericPolicy, true, "")
+	return nil
 }
